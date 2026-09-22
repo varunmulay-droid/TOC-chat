@@ -1,0 +1,9 @@
+torch
+transformers>=4.44
+auto-gptq
+sentence-transformers
+faiss-cpu
+gradio>=4.0
+pypdf
+numpy
+pandas
