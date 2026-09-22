@@ -4,7 +4,17 @@ models/llm.py
 LLM loading + generation, wrapped so the model SIZE is a config choice,
 not a hardcoded assumption.
 
-Why not just hardcode Qwen2.5-7B-Instruct-GPTQ-Int4:
+Quantization note: this now uses bitsandbytes 4-bit quantization (via
+transformers' built-in BitsAndBytesConfig) instead of pre-quantized GPTQ
+checkpoints. GPTQ checkpoints require the `auto-gptq` package, which has
+no reliable prebuilt wheels on most platforms (Colab/Kaggle/Windows/many
+Linux setups) and falls back to a from-source build that regularly fails
+with legacy setup.py/egg errors and CUDA-toolchain mismatches.
+bitsandbytes ships prebuilt wheels for the common platforms and quantizes
+the standard instruct checkpoint on load -- same memory benefit, far
+fewer install failures.
+
+Why not just hardcode the 7B model:
   - On free Colab T4 (16GB) and especially HF ZeroGPU (cold-start budget
     matters), a 7B 4-bit model's load time + KV cache + concurrent MiniLM
     encoder can blow the memory/time budget once you add RAG context and
@@ -13,15 +23,15 @@ Why not just hardcode Qwen2.5-7B-Instruct-GPTQ-Int4:
     as an opt-in for users running on Colab Pro / a bigger GPU.
 
 Set TOC_GPT_MODEL env var to override, e.g.:
-    TOC_GPT_MODEL=Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4
+    TOC_GPT_MODEL=Qwen/Qwen2.5-7B-Instruct
 """
 
 import os
 from dataclasses import dataclass
 from typing import Optional
 
-DEFAULT_MODEL = "Qwen/Qwen2.5-3B-Instruct-GPTQ-Int4"
-LARGE_MODEL = "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4"   # opt-in, needs more VRAM / time
+DEFAULT_MODEL = "Qwen/Qwen2.5-3B-Instruct"
+LARGE_MODEL = "Qwen/Qwen2.5-7B-Instruct"   # opt-in, needs more VRAM / time
 
 
 @dataclass
@@ -31,6 +41,7 @@ class LLMConfig:
     temperature: float = 0.7
     top_p: float = 0.9
     device_map: str = "auto"
+    load_in_4bit: bool = os.environ.get("TOC_GPT_4BIT", "1") == "1"  # set to "0" to disable on CPU-only setups
 
 
 class QwenLLM:
@@ -54,11 +65,30 @@ class QwenLLM:
 
         print(f"[llm] Loading {self.config.model_name} ...")
         self._tokenizer = AutoTokenizer.from_pretrained(self.config.model_name)
-        self._model = AutoModelForCausalLM.from_pretrained(
-            self.config.model_name,
-            device_map=self.config.device_map,
-            torch_dtype=torch.float16,
-        )
+
+        use_4bit = self.config.load_in_4bit and torch.cuda.is_available()
+        if use_4bit:
+            from transformers import BitsAndBytesConfig
+            quant_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+            self._model = AutoModelForCausalLM.from_pretrained(
+                self.config.model_name,
+                device_map=self.config.device_map,
+                quantization_config=quant_config,
+            )
+        else:
+            # CPU-only or 4-bit explicitly disabled: fall back to plain fp32/fp16 load.
+            # Slower and heavier, but installs and runs anywhere -- no bitsandbytes
+            # CUDA kernel requirement.
+            self._model = AutoModelForCausalLM.from_pretrained(
+                self.config.model_name,
+                device_map=self.config.device_map if torch.cuda.is_available() else None,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            )
         print("[llm] Model loaded.")
 
     def generate(self, prompt: str, system_prompt: Optional[str] = None) -> str:

@@ -29,11 +29,15 @@ in your report as the theoretical ceiling of the model, not as a file.
 
 ## Models
 
-- **LLM**: `Qwen/Qwen2.5-3B-Instruct-GPTQ-Int4` by default (set `TOC_GPT_MODEL`
-  env var to switch, e.g. to the 7B variant if you have more VRAM/time budget).
-  3B is the default because a 7B model's cold-start load time can blow HF
-  Spaces ZeroGPU's request timeout, and 3B leaves headroom for RAG + memory
-  context on a T4.
+- **LLM**: `Qwen/Qwen2.5-3B-Instruct` by default, quantized to 4-bit at load
+  time via `bitsandbytes` (set `TOC_GPT_MODEL` env var to switch, e.g. to the
+  7B variant if you have more VRAM/time budget; set `TOC_GPT_4BIT=0` to
+  disable quantization on CPU-only setups). 3B is the default because a 7B
+  model's cold-start load time can blow HF Spaces ZeroGPU's request timeout,
+  and 3B leaves headroom for RAG + memory context on a T4.
+  Uses `bitsandbytes` rather than pre-quantized GPTQ checkpoints, since
+  `auto-gptq` (required for GPTQ) has no reliable prebuilt wheels on most
+  platforms and frequently fails to build from source.
 - **Encoder**: `sentence-transformers/all-MiniLM-L6-v2`, CPU by default.
 - **Vector store**: FAISS (CPU), shared implementation for both RAG chunks
   and conversation memory.
