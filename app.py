@@ -20,6 +20,32 @@ Run:
     python app.py
 """
 
+# IMPORTANT: on Hugging Face Spaces with ZeroGPU hardware, the `spaces`
+# package must be imported BEFORE any CUDA-touching package (torch,
+# transformers, etc.) -- ZeroGPU needs to intercept CUDA initialization
+# itself to allocate GPU time per-request. Importing it later raises
+# "CUDA has been initialized before importing the `spaces` package."
+# Everywhere else (Colab, local, plain HF Spaces without ZeroGPU) this
+# package either isn't installed or isn't needed, so we fall back to a
+# no-op decorator rather than hard-requiring it.
+try:
+    import spaces
+    _ON_ZEROGPU = True
+except ImportError:
+    _ON_ZEROGPU = False
+
+    class _NoOpSpaces:
+        @staticmethod
+        def GPU(fn=None, **kwargs):
+            # Support both @spaces.GPU and @spaces.GPU(duration=...) usage
+            if fn is not None:
+                return fn
+            def decorator(f):
+                return f
+            return decorator
+
+    spaces = _NoOpSpaces()
+
 import io
 import re
 import csv
@@ -50,8 +76,22 @@ MEMORY_TURNS_IN_PROMPT = 6                # how many recent exchanges to feed ba
 
 import threading
 
-_device = "cuda" if torch.cuda.is_available() else "cpu"
-_dtype = torch.float16 if _device == "cuda" else torch.float32
+# NOTE: device/dtype are deliberately NOT computed here at import time.
+# On Hugging Face ZeroGPU, torch.cuda.is_available() only returns True
+# *inside* an @spaces.GPU-decorated call -- checking it here at module
+# load (before any such call) would always see "no GPU" and permanently
+# load the model on CPU even once a GPU is allocated later. Instead,
+# _resolve_device() is called lazily inside get_llm(), which is only ever
+# invoked from generate() (which IS spaces.GPU-decorated), so it sees the
+# correct hardware state at the right time on every platform.
+def _resolve_device():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    return device, dtype
+
+_device, _dtype = _resolve_device()   # best-effort default for non-ZeroGPU platforms
+                                        # (Colab, local, plain Spaces) where CUDA is
+                                        # visible immediately; re-resolved in get_llm()
 
 # Max prompt tokens allowed before we truncate context/memory. Prevents a
 # single very long prompt (big RAG context + long memory history) from
@@ -76,10 +116,13 @@ _gpu_lock = threading.Lock()
 
 
 def get_llm():
-    global _llm, _tokenizer
+    global _llm, _tokenizer, _device, _dtype
     if _llm is None:
         with _gpu_lock:
             if _llm is None:  # re-check after acquiring the lock
+                _device, _dtype = _resolve_device()  # re-resolve now that we're
+                                                        # (potentially) inside a
+                                                        # spaces.GPU-allocated context
                 _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
                 _llm = AutoModelForCausalLM.from_pretrained(
                     MODEL_NAME,
@@ -225,6 +268,7 @@ def clear_memory():
 # ---------------------------------------------------------------------------
 # LLM generation
 # ---------------------------------------------------------------------------
+@spaces.GPU(duration=60)  # ZeroGPU: allocate GPU for up to 60s per call; no-op off HF Spaces
 def generate(user_message: str, context_chunks: list[str], use_memory: bool = True) -> str:
     model, tokenizer = get_llm()
 
