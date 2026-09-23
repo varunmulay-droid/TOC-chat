@@ -338,7 +338,7 @@ def excel_fn(description):
     return path, preview
 
 
-with gr.Blocks(title="Simple RAG + Excel Assistant", default_concurrency_limit=1) as demo:
+with gr.Blocks(title="Simple RAG + Excel Assistant") as demo:
     gr.Markdown(
         "# Simple RAG Assistant\n"
         f"Open-source model: `{MODEL_NAME}` (no GPTQ, no bitsandbytes — plain load, runs on CPU or GPU).\n\n"
@@ -372,4 +372,9 @@ with gr.Blocks(title="Simple RAG + Excel Assistant", default_concurrency_limit=1
 
 
 if __name__ == "__main__":
+    # Serialize all callbacks through Gradio's queue (Gradio 6.x moved this
+    # off the Blocks() constructor and onto .queue()). This is belt-and-
+    # suspenders alongside the _gpu_lock in app.py's generate()/get_llm() --
+    # it stops two GPU-bound requests from even being dispatched concurrently.
+    demo.queue(default_concurrency_limit=1)
     demo.launch()
