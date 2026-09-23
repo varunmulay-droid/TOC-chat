@@ -23,6 +23,8 @@ Run:
 import io
 import re
 import csv
+import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -43,6 +45,8 @@ CHUNK_WORDS = 300
 CHUNK_OVERLAP = 40
 TOP_K = 4
 MAX_NEW_TOKENS = 400
+MEMORY_FILE = Path("chat_memory.json")   # plain JSON, no DB server/driver to break
+MEMORY_TURNS_IN_PROMPT = 6                # how many recent exchanges to feed back as context
 
 _device = "cuda" if torch.cuda.is_available() else "cpu"
 _dtype = torch.float16 if _device == "cuda" else torch.float32
@@ -61,7 +65,10 @@ def get_llm():
         _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
         _llm = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME,
-            torch_dtype=_dtype,
+            dtype=_dtype,               # transformers>=4.5x renamed torch_dtype -> dtype;
+                                          # the old kwarg is silently ignored on newer
+                                          # versions, which loads fp32 and doubles memory
+            low_cpu_mem_usage=True,
         ).to(_device)
     return _llm, _tokenizer
 
@@ -157,33 +164,85 @@ def retrieve(query: str, k: int = TOP_K) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Conversation memory — plain JSON file, no DB server/driver required.
+# Persists across restarts (survives a Colab session as long as the file
+# system does); each turn is appended, and the most recent N turns are fed
+# back to the model as extra context so it "remembers" the conversation.
+# ---------------------------------------------------------------------------
+def load_memory() -> list[dict]:
+    if not MEMORY_FILE.exists():
+        return []
+    try:
+        return json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []  # corrupt or unreadable file -- start fresh rather than crash
+
+
+def save_turn(user_text: str, assistant_text: str):
+    history = load_memory()
+    history.append({
+        "timestamp": time.time(),
+        "user": user_text,
+        "assistant": assistant_text,
+    })
+    MEMORY_FILE.write_text(json.dumps(history, indent=2), encoding="utf-8")
+
+
+def recent_memory_as_messages(n: int = MEMORY_TURNS_IN_PROMPT) -> list[dict]:
+    """Return the last n turns as chat-template-ready message dicts."""
+    history = load_memory()[-n:]
+    messages = []
+    for turn in history:
+        messages.append({"role": "user", "content": turn["user"]})
+        messages.append({"role": "assistant", "content": turn["assistant"]})
+    return messages
+
+
+def clear_memory():
+    if MEMORY_FILE.exists():
+        MEMORY_FILE.unlink()
+    return "Conversation memory cleared."
+
+
+# ---------------------------------------------------------------------------
 # LLM generation
 # ---------------------------------------------------------------------------
-def generate(user_message: str, context_chunks: list[str]) -> str:
+def generate(user_message: str, context_chunks: list[str], use_memory: bool = True) -> str:
     model, tokenizer = get_llm()
 
     system_prompt = (
         "You are a helpful assistant. If context from documents is provided, "
-        "ground your answer in it and say so; otherwise answer from general knowledge."
+        "ground your answer in it and say so; otherwise answer from general knowledge. "
+        "You also have access to recent conversation history -- use it to stay "
+        "consistent with what's already been discussed."
     )
     if context_chunks:
         system_prompt += "\n\nContext:\n" + "\n---\n".join(context_chunks)
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message},
-    ]
+    messages = [{"role": "system", "content": system_prompt}]
+    if use_memory:
+        messages.extend(recent_memory_as_messages())
+    messages.append({"role": "user", "content": user_message})
+
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = tokenizer(text, return_tensors="pt").to(_device)
 
-    output = model.generate(
-        **inputs,
-        max_new_tokens=MAX_NEW_TOKENS,
-        temperature=0.7,
-        top_p=0.9,
-        do_sample=True,
-        pad_token_id=tokenizer.eos_token_id,
-    )
+    try:
+        output = model.generate(
+            **inputs,
+            max_new_tokens=MAX_NEW_TOKENS,
+            temperature=0.7,
+            top_p=0.9,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        raise RuntimeError(
+            "GPU ran out of memory generating this response. Try a shorter message, "
+            "fewer uploaded documents, or restart the runtime to clear GPU memory."
+        )
+
     decoded = tokenizer.decode(output[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
     return decoded.strip()
 
@@ -198,7 +257,7 @@ def generate_excel(description: str, context_chunks: list[str]):
         "Respond with ONLY a CSV table (comma-separated, first row = column headers). "
         "No explanation, no markdown code fences, just the raw CSV."
     )
-    raw = generate(instruction, context_chunks)
+    raw = generate(instruction, context_chunks, use_memory=False)
 
     # Strip accidental markdown fences if the model adds them anyway
     raw = re.sub(r"^```(csv)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
@@ -220,7 +279,9 @@ def generate_excel(description: str, context_chunks: list[str]):
 # ---------------------------------------------------------------------------
 def chat_fn(message, history):
     context = retrieve(message)
-    return generate(message, context)
+    response = generate(message, context)
+    save_turn(message, response)
+    return response
 
 
 def ingest_fn(files):
@@ -245,6 +306,10 @@ with gr.Blocks(title="Simple RAG + Excel Assistant") as demo:
 
     with gr.Tab("Chat"):
         gr.ChatInterface(fn=chat_fn)
+        with gr.Row():
+            clear_mem_btn = gr.Button("Clear conversation memory")
+            clear_mem_status = gr.Textbox(label="Status", interactive=False, scale=2)
+        clear_mem_btn.click(clear_memory, outputs=clear_mem_status)
 
     with gr.Tab("Upload documents"):
         file_input = gr.File(file_count="multiple", label="PDF / TXT / CSV / XLSX")
