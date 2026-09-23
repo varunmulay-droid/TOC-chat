@@ -48,8 +48,15 @@ MAX_NEW_TOKENS = 400
 MEMORY_FILE = Path("chat_memory.json")   # plain JSON, no DB server/driver to break
 MEMORY_TURNS_IN_PROMPT = 6                # how many recent exchanges to feed back as context
 
+import threading
+
 _device = "cuda" if torch.cuda.is_available() else "cpu"
 _dtype = torch.float16 if _device == "cuda" else torch.float32
+
+# Max prompt tokens allowed before we truncate context/memory. Prevents a
+# single very long prompt (big RAG context + long memory history) from
+# causing a huge quadratic attention allocation.
+MAX_PROMPT_TOKENS = 2048
 
 # ---------------------------------------------------------------------------
 # Lazy-loaded models (loaded once, on first use)
@@ -58,18 +65,29 @@ _llm = None
 _tokenizer = None
 _embedder = None
 
+# Gradio runs each tab's callback on its own worker thread. Without a lock,
+# two requests arriving close together (e.g. a chat message and an Excel
+# generation) can both see the model as unloaded and each load a FULL
+# separate copy onto the GPU at the same time -- doubling memory before
+# generation even starts. This lock serializes both loading AND generation,
+# since a single T4/consumer GPU can't safely run two generate() calls
+# concurrently anyway.
+_gpu_lock = threading.Lock()
+
 
 def get_llm():
     global _llm, _tokenizer
     if _llm is None:
-        _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-        _llm = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
-            dtype=_dtype,               # transformers>=4.5x renamed torch_dtype -> dtype;
-                                          # the old kwarg is silently ignored on newer
-                                          # versions, which loads fp32 and doubles memory
-            low_cpu_mem_usage=True,
-        ).to(_device)
+        with _gpu_lock:
+            if _llm is None:  # re-check after acquiring the lock
+                _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+                _llm = AutoModelForCausalLM.from_pretrained(
+                    MODEL_NAME,
+                    dtype=_dtype,               # transformers>=4.5x renamed torch_dtype -> dtype;
+                                                  # the old kwarg is silently ignored on newer
+                                                  # versions, which loads fp32 and doubles memory
+                    low_cpu_mem_usage=True,
+                ).to(_device)
     return _llm, _tokenizer
 
 
@@ -219,29 +237,53 @@ def generate(user_message: str, context_chunks: list[str], use_memory: bool = Tr
     if context_chunks:
         system_prompt += "\n\nContext:\n" + "\n---\n".join(context_chunks)
 
-    messages = [{"role": "system", "content": system_prompt}]
-    if use_memory:
-        messages.extend(recent_memory_as_messages())
-    messages.append({"role": "user", "content": user_message})
+    system_msg = {"role": "system", "content": system_prompt}
+    user_msg = {"role": "user", "content": user_message}
+    memory_msgs = recent_memory_as_messages() if use_memory else []
 
-    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(text, return_tensors="pt").to(_device)
+    def build_and_count(mem_msgs):
+        msgs = [system_msg] + mem_msgs + [user_msg]
+        text = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        token_count = len(tokenizer(text, return_tensors="pt")["input_ids"][0])
+        return text, token_count
 
-    try:
-        output = model.generate(
-            **inputs,
-            max_new_tokens=MAX_NEW_TOKENS,
-            temperature=0.7,
-            top_p=0.9,
-            do_sample=True,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-    except torch.cuda.OutOfMemoryError:
-        torch.cuda.empty_cache()
-        raise RuntimeError(
-            "GPU ran out of memory generating this response. Try a shorter message, "
-            "fewer uploaded documents, or restart the runtime to clear GPU memory."
-        )
+    text, token_count = build_and_count(memory_msgs)
+    # If the prompt (system + memory + current message) exceeds the budget,
+    # drop the OLDEST memory turns first (two messages at a time -- one
+    # user/assistant pair) until it fits. This is what actually caps the
+    # quadratic attention-memory blowup, rather than just capping turn count,
+    # since a single earlier response full of code can be hundreds of tokens.
+    while token_count > MAX_PROMPT_TOKENS and len(memory_msgs) >= 2:
+        memory_msgs = memory_msgs[2:]
+        text, token_count = build_and_count(memory_msgs)
+
+    # If it's STILL too big even with zero memory (e.g. huge RAG context),
+    # truncate the tokenized input directly as a last resort.
+    inputs = tokenizer(text, return_tensors="pt")
+    if inputs["input_ids"].shape[1] > MAX_PROMPT_TOKENS:
+        inputs["input_ids"] = inputs["input_ids"][:, -MAX_PROMPT_TOKENS:]
+        inputs["attention_mask"] = inputs["attention_mask"][:, -MAX_PROMPT_TOKENS:]
+    inputs = inputs.to(_device)
+
+    # Serialize GPU access: only one generate() call runs at a time, so two
+    # concurrent Gradio requests (e.g. chat + Excel generation) can't both
+    # try to hold model activations on the GPU simultaneously.
+    with _gpu_lock:
+        try:
+            output = model.generate(
+                **inputs,
+                max_new_tokens=MAX_NEW_TOKENS,
+                temperature=0.7,
+                top_p=0.9,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            raise RuntimeError(
+                "GPU ran out of memory generating this response. Try a shorter message, "
+                "fewer uploaded documents, or restart the runtime to clear GPU memory."
+            )
 
     decoded = tokenizer.decode(output[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
     return decoded.strip()
@@ -296,7 +338,7 @@ def excel_fn(description):
     return path, preview
 
 
-with gr.Blocks(title="Simple RAG + Excel Assistant") as demo:
+with gr.Blocks(title="Simple RAG + Excel Assistant", default_concurrency_limit=1) as demo:
     gr.Markdown(
         "# Simple RAG Assistant\n"
         f"Open-source model: `{MODEL_NAME}` (no GPTQ, no bitsandbytes — plain load, runs on CPU or GPU).\n\n"
