@@ -1,10 +1,9 @@
 torch>=2.1
 transformers>=4.44
-accelerate>=0.30
-bitsandbytes>=0.43
 sentence-transformers>=2.7
 faiss-cpu==1.8.0
 gradio>=4.0
 pypdf>=4.0
-numpy<2.0
 pandas>=2.0
+openpyxl>=3.1
+numpy<2.0
