@@ -28,7 +28,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import gradio as gr
-import faiss
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -75,11 +74,22 @@ def get_embedder():
 
 
 # ---------------------------------------------------------------------------
-# In-memory vector store
+# In-memory vector store (plain NumPy — no FAISS dependency to break on
+# platform/Python-version mismatches). Embeddings are L2-normalized, so a
+# dot product is equivalent to cosine similarity.
 # ---------------------------------------------------------------------------
-index = faiss.IndexFlatIP(EMBED_DIM)
+chunk_vectors: np.ndarray | None = None   # shape (n_chunks, EMBED_DIM)
 chunk_texts: list[str] = []
 chunk_sources: list[str] = []
+
+
+def add_vectors(vectors: np.ndarray):
+    global chunk_vectors
+    vectors = vectors.astype(np.float32)
+    if chunk_vectors is None:
+        chunk_vectors = vectors
+    else:
+        chunk_vectors = np.vstack([chunk_vectors, vectors])
 
 
 def chunk_text(text: str, words_per_chunk: int = CHUNK_WORDS, overlap: int = CHUNK_OVERLAP) -> list[str]:
@@ -128,26 +138,22 @@ def ingest_files(files) -> str:
         if not chunks:
             continue
         vectors = embedder.encode(chunks, convert_to_numpy=True, normalize_embeddings=True)
-        index.add(vectors.astype(np.float32))
+        add_vectors(vectors)
         chunk_texts.extend(chunks)
         chunk_sources.extend([Path(path).name] * len(chunks))
         total_chunks += len(chunks)
-    return f"Ingested {len(files)} file(s), {total_chunks} chunks. Knowledge base now has {index.ntotal} chunks total."
+    return f"Ingested {len(files)} file(s), {total_chunks} chunks. Knowledge base now has {len(chunk_texts)} chunks total."
 
 
 def retrieve(query: str, k: int = TOP_K) -> list[str]:
-    if index.ntotal == 0:
+    if chunk_vectors is None or len(chunk_texts) == 0:
         return []
     embedder = get_embedder()
-    qvec = embedder.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
-    k = min(k, index.ntotal)
-    scores, idxs = index.search(qvec, k)
-    results = []
-    for score, idx in zip(scores[0], idxs[0]):
-        if idx == -1:
-            continue
-        results.append(f"[{chunk_sources[idx]}] {chunk_texts[idx]}")
-    return results
+    qvec = embedder.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)[0]
+    scores = chunk_vectors @ qvec  # cosine similarity, since both sides are normalized
+    k = min(k, len(chunk_texts))
+    top_idxs = np.argsort(-scores)[:k]
+    return [f"[{chunk_sources[i]}] {chunk_texts[i]}" for i in top_idxs]
 
 
 # ---------------------------------------------------------------------------
